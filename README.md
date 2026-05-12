@@ -202,3 +202,4 @@ Para despliegue con múltiples instancias (PM2 cluster, Kubernetes):
 
 3. **PDFs grandes**: Para archivos >50MB, usar `multipart/form-data`
    en lugar de base64 via tRPC (que tiene límite de body).
+# claude-demo-mysql
