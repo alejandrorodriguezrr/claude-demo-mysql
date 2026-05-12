@@ -1,0 +1,1060 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { trpc } from "@/lib/trpc/client";
+import type { ResultadoProcesarPdf } from "@/server/routers/pdf.router";
+
+type EstadoProceso = "idle" | "procesando" | "completado" | "error";
+
+interface HistorialItem {
+  tipo: string;
+  nombre: string;
+  hora: string;
+}
+
+interface LogEntry {
+  id: number;
+  texto: string;
+  ts: Date;
+}
+
+function formatearTamano(bytes: number) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+}
+
+function convertirArchivoABase64(file: File): Promise<string> {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      const result = reader.result as string;
+      resolve(result.split(",")[1] ?? "");
+    };
+
+    reader.readAsDataURL(file);
+  });
+}
+
+export default function PaginaPrincipal() {
+  const [archivoActual, setArchivoActual] = useState<File | null>(null);
+  const [estado, setEstado] = useState<EstadoProceso>("idle");
+  const [resultado, setResultado] = useState<ResultadoProcesarPdf | null>(null);
+  const [historial, setHistorial] = useState<HistorialItem[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [porcentaje, setPorcentaje] = useState(0);
+  const [textoProgreso, setTextoProgreso] = useState("Iniciando...");
+  const [paso, setPaso] = useState(1);
+  const [arrastrando, setArrastrando] = useState(false);
+
+  const inputRef = useRef<HTMLInputElement>(null);
+  const sseRef = useRef<EventSource | null>(null);
+  const logIdRef = useRef(0);
+
+  const agregarLog = useCallback((texto: string) => {
+    setLogs((prev) => [
+      ...prev,
+      {
+        id: logIdRef.current++,
+        texto,
+        ts: new Date(),
+      },
+    ]);
+  }, []);
+
+  const limpiarResultado = () => {
+    setResultado(null);
+    setError(null);
+    setLogs([]);
+    setPorcentaje(0);
+    setTextoProgreso("Iniciando...");
+    setPaso(1);
+  };
+
+  const seleccionarArchivo = (file: File) => {
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
+      setError("Solo se admiten archivos PDF.");
+      return;
+    }
+
+    setArchivoActual(file);
+    limpiarResultado();
+    setEstado("idle");
+    agregarLog(`Archivo seleccionado: ${file.name}`);
+    agregarLog(`Tamaño: ${formatearTamano(file.size)}`);
+  };
+
+  const quitarArchivo = () => {
+    setArchivoActual(null);
+    setPorcentaje(0);
+    setTextoProgreso("Iniciando...");
+    setPaso(1);
+
+    if (inputRef.current) {
+      inputRef.current.value = "";
+    }
+  };
+
+  const cambiarProgreso = (pct: number, texto: string, pasoActual: number) => {
+    setPorcentaje(pct);
+    setTextoProgreso(texto);
+    setPaso(pasoActual);
+  };
+
+  const mutation = trpc.pdf.procesarPdf.useMutation({
+    onSuccess: (data) => {
+      cambiarProgreso(100, "Completado", 3);
+      setEstado("completado");
+      setResultado(data);
+      setError(null);
+
+      if (archivoActual) {
+        const item: HistorialItem = {
+          tipo: data.tipoSeguro || "OTRO",
+          nombre: archivoActual.name,
+          hora: new Date().toLocaleTimeString("es-ES", {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+        };
+
+        setHistorial((prev) => [item, ...prev]);
+      }
+
+      sseRef.current?.close();
+    },
+
+    onError: (err) => {
+      setEstado("error");
+      setError(err.message || "Error al procesar el PDF.");
+      agregarLog(`ERROR: ${err.message}`);
+      sseRef.current?.close();
+    },
+  });
+
+  const procesarPDF = async () => {
+    if (!archivoActual) return;
+
+    limpiarResultado();
+    setEstado("procesando");
+
+    cambiarProgreso(10, "Subiendo archivo...", 1);
+
+    const sessionId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const sse = new EventSource(`/api/sse/${sessionId}`);
+    sseRef.current = sse;
+
+    sse.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data) as {
+          tipo: string;
+          mensaje?: string;
+        };
+
+        if (payload.tipo === "log" && payload.mensaje) {
+          agregarLog(payload.mensaje);
+
+          const mensaje = payload.mensaje.toLowerCase();
+
+          if (mensaje.includes("extrayendo texto")) {
+            cambiarProgreso(30, "Extrayendo texto del PDF...", 1);
+          }
+
+          if (mensaje.includes("claude")) {
+            cambiarProgreso(60, "Analizando con Claude AI...", 2);
+          }
+
+          if (mensaje.includes("guardando") || mensaje.includes("mysql")) {
+            cambiarProgreso(85, "Guardando en base de datos...", 3);
+          }
+        }
+      } catch {
+        // Se ignoran mensajes no válidos del stream.
+      }
+    };
+
+    sse.onerror = () => {
+      sse.close();
+    };
+
+    try {
+      const base64 = await convertirArchivoABase64(archivoActual);
+
+      mutation.mutate({
+        pdfBase64: base64,
+        nombreArchivo: archivoActual.name,
+        sessionId,
+      });
+    } catch {
+      setEstado("error");
+      setError("No se pudo leer el archivo PDF.");
+    }
+  };
+
+  const onDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+
+    if (estado !== "procesando") {
+      setArrastrando(true);
+    }
+  };
+
+  const onDragLeave = () => {
+    setArrastrando(false);
+  };
+
+  const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setArrastrando(false);
+
+    if (estado === "procesando") return;
+
+    const file = e.dataTransfer.files[0];
+
+    if (file) {
+      seleccionarArchivo(file);
+    }
+  };
+
+  const abrirSelector = () => {
+    if (estado !== "procesando") {
+      inputRef.current?.click();
+    }
+  };
+
+  const estaProcesando = estado === "procesando";
+
+  return (
+    <>
+      <style suppressHydrationWarning>{`
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500&display=swap');
+
+        :root {
+          --bg: #0a0a0f;
+          --surface: #111118;
+          --border: #1e1e2e;
+          --accent: #c8a97e;
+          --accent2: #7e9ec8;
+          --text: #e8e6df;
+          --muted: #6b6b80;
+          --success: #4caf7d;
+          --error: #cf6679;
+          --card: #13131c;
+        }
+
+        * {
+          box-sizing: border-box;
+        }
+
+        body {
+          margin: 0;
+          background: var(--bg);
+          color: var(--text);
+          font-family: 'DM Sans', sans-serif;
+          min-height: 100vh;
+          overflow-x: hidden;
+        }
+
+        body::before {
+          content: '';
+          position: fixed;
+          inset: 0;
+          background:
+            radial-gradient(ellipse 80% 50% at 20% 20%, rgba(200,169,126,0.04) 0%, transparent 60%),
+            radial-gradient(ellipse 60% 40% at 80% 80%, rgba(126,158,200,0.04) 0%, transparent 60%);
+          pointer-events: none;
+          z-index: 0;
+        }
+
+        .container {
+          max-width: 900px;
+          margin: 0 auto;
+          padding: 60px 24px;
+          position: relative;
+          z-index: 1;
+        }
+
+        header {
+          margin-bottom: 64px;
+        }
+
+        .logo-line {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          margin-bottom: 8px;
+        }
+
+        .logo-dot {
+          width: 8px;
+          height: 8px;
+          background: var(--accent);
+          border-radius: 50%;
+          animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+          0%, 100% {
+            opacity: 1;
+            transform: scale(1);
+          }
+
+          50% {
+            opacity: 0.5;
+            transform: scale(0.8);
+          }
+        }
+
+        h1 {
+          font-family: 'Playfair Display', serif;
+          font-size: clamp(36px, 5vw, 56px);
+          font-weight: 900;
+          line-height: 1.1;
+          color: var(--text);
+          margin: 0 0 16px 0;
+        }
+
+        h1 span {
+          color: var(--accent);
+        }
+
+        .logo-tag {
+          font-family: 'DM Mono', monospace;
+          font-size: 11px;
+          color: var(--accent);
+          letter-spacing: 0.15em;
+          text-transform: uppercase;
+        }
+
+        .subtitle {
+          font-size: 16px;
+          color: var(--muted);
+          font-weight: 300;
+          max-width: 500px;
+          line-height: 1.6;
+          margin: 0;
+        }
+
+        .drop-zone {
+          border: 1.5px dashed var(--border);
+          border-radius: 16px;
+          padding: 64px 32px;
+          text-align: center;
+          cursor: pointer;
+          transition: all 0.3s ease;
+          background: var(--card);
+          position: relative;
+          overflow: hidden;
+          margin-bottom: 32px;
+        }
+
+        .drop-zone::before {
+          content: '';
+          position: absolute;
+          inset: 0;
+          background: radial-gradient(ellipse at center, rgba(200,169,126,0.03) 0%, transparent 70%);
+          transition: opacity 0.3s;
+          opacity: 0;
+        }
+
+        .drop-zone:hover,
+        .drop-zone.drag-over {
+          border-color: var(--accent);
+          background: #16161f;
+        }
+
+        .drop-zone:hover::before,
+        .drop-zone.drag-over::before {
+          opacity: 1;
+        }
+
+        .drop-zone.drag-over {
+          transform: scale(1.01);
+        }
+
+        .drop-icon {
+          width: 64px;
+          height: 64px;
+          margin: 0 auto 24px;
+          opacity: 0.4;
+          transition: opacity 0.3s, transform 0.3s;
+        }
+
+        .drop-zone:hover .drop-icon {
+          opacity: 0.7;
+          transform: translateY(-4px);
+        }
+
+        .drop-title {
+          font-size: 18px;
+          font-weight: 500;
+          margin-bottom: 8px;
+          color: var(--text);
+        }
+
+        .drop-sub {
+          font-size: 14px;
+          color: var(--muted);
+          margin-bottom: 24px;
+        }
+
+        .btn-browse {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 10px 24px;
+          background: transparent;
+          border: 1px solid var(--accent);
+          color: var(--accent);
+          border-radius: 8px;
+          font-size: 13px;
+          font-family: 'DM Mono', monospace;
+          letter-spacing: 0.05em;
+          cursor: pointer;
+          transition: all 0.2s;
+        }
+
+        .btn-browse:hover {
+          background: var(--accent);
+          color: var(--bg);
+        }
+
+        .file-selected {
+          display: flex;
+          align-items: center;
+          gap: 16px;
+          padding: 20px 24px;
+          background: var(--card);
+          border: 1px solid var(--border);
+          border-radius: 12px;
+          margin-bottom: 20px;
+        }
+
+        .file-icon {
+          width: 40px;
+          height: 40px;
+          background: rgba(200,169,126,0.1);
+          border-radius: 8px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          flex-shrink: 0;
+        }
+
+        .file-info {
+          flex: 1;
+          min-width: 0;
+        }
+
+        .file-name {
+          font-size: 14px;
+          font-weight: 500;
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          margin-bottom: 2px;
+        }
+
+        .file-size {
+          font-size: 12px;
+          color: var(--muted);
+          font-family: 'DM Mono', monospace;
+        }
+
+        .btn-remove {
+          background: none;
+          border: none;
+          color: var(--muted);
+          cursor: pointer;
+          padding: 4px;
+          transition: color 0.2s;
+          flex-shrink: 0;
+        }
+
+        .btn-remove:hover {
+          color: var(--error);
+        }
+
+        .btn-process {
+          width: 100%;
+          padding: 16px;
+          background: var(--accent);
+          color: var(--bg);
+          border: none;
+          border-radius: 12px;
+          font-size: 15px;
+          font-weight: 500;
+          cursor: pointer;
+          transition: all 0.2s;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 10px;
+          font-family: 'DM Sans', sans-serif;
+          margin-bottom: 32px;
+        }
+
+        .btn-process:hover {
+          background: #d4b68e;
+          transform: translateY(-1px);
+        }
+
+        .btn-process:active {
+          transform: translateY(0);
+        }
+
+        .btn-process:disabled {
+          opacity: 0.5;
+          cursor: not-allowed;
+          transform: none;
+        }
+
+        .progress-wrap {
+          margin-bottom: 32px;
+        }
+
+        .progress-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 10px;
+        }
+
+        .progress-label {
+          font-size: 13px;
+          color: var(--muted);
+          font-family: 'DM Mono', monospace;
+        }
+
+        .progress-pct {
+          font-size: 13px;
+          color: var(--accent);
+          font-family: 'DM Mono', monospace;
+        }
+
+        .progress-bar {
+          height: 3px;
+          background: var(--border);
+          border-radius: 2px;
+          overflow: hidden;
+        }
+
+        .progress-fill {
+          height: 100%;
+          background: linear-gradient(90deg, var(--accent), var(--accent2));
+          border-radius: 2px;
+          width: 0%;
+          transition: width 0.4s ease;
+        }
+
+        .progress-steps {
+          display: flex;
+          gap: 8px;
+          margin-top: 16px;
+          flex-wrap: wrap;
+        }
+
+        .step-badge {
+          font-size: 11px;
+          font-family: 'DM Mono', monospace;
+          padding: 4px 10px;
+          border-radius: 4px;
+          background: var(--border);
+          color: var(--muted);
+          transition: all 0.3s;
+        }
+
+        .step-badge.active {
+          background: rgba(200,169,126,0.15);
+          color: var(--accent);
+        }
+
+        .step-badge.done {
+          background: rgba(76,175,125,0.1);
+          color: var(--success);
+        }
+
+        .result-card {
+          background: var(--card);
+          border: 1px solid var(--border);
+          border-radius: 16px;
+          overflow: hidden;
+          margin-bottom: 32px;
+          animation: slideUp 0.4s ease;
+        }
+
+        @keyframes slideUp {
+          from {
+            opacity: 0;
+            transform: translateY(16px);
+          }
+
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+
+        .result-header {
+          padding: 20px 24px;
+          border-bottom: 1px solid var(--border);
+          display: flex;
+          align-items: center;
+          gap: 12px;
+        }
+
+        .result-status {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          background: var(--success);
+        }
+
+        .result-title {
+          font-size: 13px;
+          font-family: 'DM Mono', monospace;
+          color: var(--success);
+          letter-spacing: 0.05em;
+        }
+
+        .result-id {
+          margin-left: auto;
+          font-size: 11px;
+          font-family: 'DM Mono', monospace;
+          color: var(--muted);
+        }
+
+        .result-body {
+          padding: 24px;
+        }
+
+        .result-tipo {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 6px 14px;
+          background: rgba(200,169,126,0.1);
+          border: 1px solid rgba(200,169,126,0.2);
+          border-radius: 6px;
+          font-size: 12px;
+          font-family: 'DM Mono', monospace;
+          color: var(--accent);
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+          margin-bottom: 16px;
+        }
+
+        .result-desc {
+          font-size: 15px;
+          line-height: 1.7;
+          color: var(--text);
+          opacity: 0.85;
+        }
+
+        .result-meta {
+          margin-top: 20px;
+          padding-top: 20px;
+          border-top: 1px solid var(--border);
+          display: flex;
+          gap: 24px;
+          flex-wrap: wrap;
+        }
+
+        .meta-item {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+        }
+
+        .meta-label {
+          font-size: 10px;
+          font-family: 'DM Mono', monospace;
+          color: var(--muted);
+          letter-spacing: 0.1em;
+          text-transform: uppercase;
+        }
+
+        .meta-value {
+          font-size: 14px;
+          font-weight: 500;
+          color: var(--text);
+        }
+
+        .error-card {
+          display: flex;
+          gap: 12px;
+          align-items: flex-start;
+          background: rgba(207,102,121,0.05);
+          border: 1px solid rgba(207,102,121,0.2);
+          border-radius: 12px;
+          padding: 20px 24px;
+          margin-bottom: 32px;
+          animation: slideUp 0.3s ease;
+        }
+
+        .error-text {
+          font-size: 14px;
+          color: var(--error);
+          line-height: 1.5;
+        }
+
+        .history-section {
+          margin-top: 48px;
+        }
+
+        .section-label {
+          font-size: 11px;
+          font-family: 'DM Mono', monospace;
+          color: var(--muted);
+          letter-spacing: 0.15em;
+          text-transform: uppercase;
+          margin-bottom: 16px;
+          display: flex;
+          align-items: center;
+          gap: 12px;
+        }
+
+        .section-label::after {
+          content: '';
+          flex: 1;
+          height: 1px;
+          background: var(--border);
+        }
+
+        .history-list {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+
+        .history-item {
+          display: flex;
+          align-items: center;
+          gap: 16px;
+          padding: 14px 18px;
+          background: var(--card);
+          border: 1px solid var(--border);
+          border-radius: 10px;
+          transition: border-color 0.2s;
+          cursor: default;
+        }
+
+        .history-item:hover {
+          border-color: rgba(200,169,126,0.3);
+        }
+
+        .history-tipo {
+          font-size: 10px;
+          font-family: 'DM Mono', monospace;
+          padding: 3px 8px;
+          background: rgba(200,169,126,0.08);
+          color: var(--accent);
+          border-radius: 4px;
+          letter-spacing: 0.08em;
+          flex-shrink: 0;
+        }
+
+        .history-name {
+          flex: 1;
+          font-size: 13px;
+          color: var(--text);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          opacity: 0.8;
+        }
+
+        .history-time {
+          font-size: 11px;
+          font-family: 'DM Mono', monospace;
+          color: var(--muted);
+          flex-shrink: 0;
+        }
+
+        .empty-history {
+          text-align: center;
+          padding: 32px;
+          color: var(--muted);
+          font-size: 13px;
+        }
+
+        .spinner {
+          width: 16px;
+          height: 16px;
+          border: 2px solid rgba(0,0,0,0.2);
+          border-top-color: var(--bg);
+          border-radius: 50%;
+          animation: spin 0.7s linear infinite;
+        }
+
+        @keyframes spin {
+          to {
+            transform: rotate(360deg);
+          }
+        }
+
+        .console {
+          background: #0f0f16;
+          border: 1px solid var(--border);
+          border-radius: 12px;
+          padding: 16px;
+          max-height: 240px;
+          overflow-y: auto;
+          margin-bottom: 32px;
+          font-family: 'DM Mono', monospace;
+          font-size: 11px;
+          color: var(--muted);
+          line-height: 1.6;
+        }
+
+        .console-line {
+          margin-bottom: 4px;
+        }
+
+        @media (max-width: 600px) {
+          .container {
+            padding: 40px 16px;
+          }
+
+          .drop-zone {
+            padding: 48px 20px;
+          }
+
+          .result-header {
+            flex-wrap: wrap;
+          }
+
+          .result-id {
+            margin-left: 0;
+            width: 100%;
+          }
+        }
+      `}</style>
+
+      <div className="container">
+        <header>
+          <div className="logo-line">
+            <div className="logo-dot"></div>
+            <span className="logo-tag">PDF Extractor · Seguros</span>
+          </div>
+
+          <h1>
+            Análisis
+            <br />
+            de <span>Pólizas</span>
+          </h1>
+
+          <p className="subtitle">
+            Sube una póliza en PDF y Claude AI extraerá y estructurará
+            automáticamente toda la información relevante en MySQL.
+          </p>
+        </header>
+
+        <div
+          className={`drop-zone ${arrastrando ? "drag-over" : ""}`}
+          onClick={abrirSelector}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={onDrop}
+        >
+          <svg className="drop-icon" viewBox="0 0 64 64" fill="none">
+            <rect x="8" y="4" width="36" height="48" rx="4" stroke="#c8a97e" strokeWidth="2" />
+            <path d="M44 4l12 12v36a4 4 0 01-4 4H12a4 4 0 01-4-4V8a4 4 0 014-4" stroke="#c8a97e" strokeWidth="2" />
+            <path d="M44 4v12h12" stroke="#c8a97e" strokeWidth="2" />
+            <path d="M20 36l8-8 8 8M28 28v16" stroke="#c8a97e" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+
+          <div className="drop-title">Arrastra tu PDF aquí</div>
+          <div className="drop-sub">o selecciona desde tu ordenador</div>
+
+          <button type="button" className="btn-browse">
+            Seleccionar archivo
+          </button>
+
+          <input
+            ref={inputRef}
+            type="file"
+            accept=".pdf"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+
+              if (file) {
+                seleccionarArchivo(file);
+              }
+            }}
+          />
+        </div>
+
+        {archivoActual && (
+          <div className="file-selected">
+            <div className="file-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#c8a97e" strokeWidth="2">
+                <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
+                <polyline points="14 2 14 8 20 8" />
+              </svg>
+            </div>
+
+            <div className="file-info">
+              <div className="file-name">{archivoActual.name}</div>
+              <div className="file-size">{formatearTamano(archivoActual.size)}</div>
+            </div>
+
+            <button
+              className="btn-remove"
+              type="button"
+              onClick={quitarArchivo}
+              title="Quitar archivo"
+              disabled={estaProcesando}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
+        )}
+
+        {archivoActual && (
+          <button
+            className="btn-process"
+            type="button"
+            onClick={procesarPDF}
+            disabled={estaProcesando}
+          >
+            {estaProcesando ? (
+              <>
+                <div className="spinner"></div>
+                <span>Procesando...</span>
+              </>
+            ) : (
+              <>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <polygon points="5 3 19 12 5 21 5 3" />
+                </svg>
+                <span>Procesar con Claude AI</span>
+              </>
+            )}
+          </button>
+        )}
+
+        {estaProcesando && (
+          <div className="progress-wrap">
+            <div className="progress-header">
+              <span className="progress-label">{textoProgreso}</span>
+              <span className="progress-pct">{porcentaje}%</span>
+            </div>
+
+            <div className="progress-bar">
+              <div className="progress-fill" style={{ width: `${porcentaje}%` }}></div>
+            </div>
+
+            <div className="progress-steps">
+              <span className={`step-badge ${paso === 1 ? "active" : paso > 1 ? "done" : ""}`}>
+                Extrayendo texto
+              </span>
+              <span className={`step-badge ${paso === 2 ? "active" : paso > 2 ? "done" : ""}`}>
+                Analizando con Claude
+              </span>
+              <span className={`step-badge ${paso === 3 ? "active" : ""}`}>
+                Guardando en BD
+              </span>
+            </div>
+          </div>
+        )}
+
+        {error && (
+          <div className="error-card">
+            <div>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#cf6679" strokeWidth="2">
+                <circle cx="12" cy="12" r="10" />
+                <line x1="12" y1="8" x2="12" y2="12" />
+                <line x1="12" y1="16" x2="12.01" y2="16" />
+              </svg>
+            </div>
+            <div className="error-text">{error}</div>
+          </div>
+        )}
+
+        {logs.length > 0 && (
+          <div className="console">
+            {logs.map((log) => (
+              <div key={log.id} className="console-line">
+                [{log.ts.toLocaleTimeString("es-ES")}] {log.texto}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {resultado && (
+          <div className="result-card">
+            <div className="result-header">
+              <div className="result-status"></div>
+              <div className="result-title">Documento procesado correctamente</div>
+              <div className="result-id">#{resultado.idDocumento}</div>
+            </div>
+
+            <div className="result-body">
+              <div className="result-tipo">{resultado.tipoSeguro || "OTRO"}</div>
+
+              <div className="result-desc">
+                El documento se ha procesado correctamente. Se ha extraído texto,
+                se ha analizado con Claude AI y se han creado las tablas necesarias
+                en la base de datos MySQL.
+              </div>
+
+              <div className="result-meta">
+                <div className="meta-item">
+                  <span className="meta-label">Archivo</span>
+                  <span className="meta-value">{archivoActual?.name || "Documento PDF"}</span>
+                </div>
+
+                <div className="meta-item">
+                  <span className="meta-label">ID Documento</span>
+                  <span className="meta-value">{resultado.idDocumento}</span>
+                </div>
+
+                <div className="meta-item">
+                  <span className="meta-label">Tipo</span>
+                  <span className="meta-value">{resultado.tipoSeguro}</span>
+                </div>
+
+                <div className="meta-item">
+                  <span className="meta-label">Tablas creadas</span>
+                  <span className="meta-value">{resultado.tablasCreadas.length}</span>
+                </div>
+
+                <div className="meta-item">
+                  <span className="meta-label">Bloques correctos</span>
+                  <span className="meta-value">
+                    {resultado.bloques.correctos}/{resultado.bloques.enviados}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="history-section">
+          <div className="section-label">Historial de sesión</div>
+
+          <div className="history-list">
+            {historial.length === 0 ? (
+              <div className="empty-history">No hay documentos procesados aún</div>
+            ) : (
+              historial.map((item, index) => (
+                <div className="history-item" key={`${item.nombre}-${index}`}>
+                  <span className="history-tipo">{item.tipo}</span>
+                  <span className="history-name">{item.nombre}</span>
+                  <span className="history-time">{item.hora}</span>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
